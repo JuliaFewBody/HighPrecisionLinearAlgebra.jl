@@ -1,0 +1,10 @@
+name = "HighPrecisionLinearAlgebra"
+uuid = "d87fc852-dd95-4f87-831c-e4755d032461"
+authors = ["Satoshi Mitsui"]
+version = "0.0.1"
+
+[compat]
+julia = "1.12"
+
+[workspace]
+projects = ["test"]

@@ -1,0 +1,6 @@
+[deps]
+HighPrecisionLinearAlgebra = "d87fc852-dd95-4f87-831c-e4755d032461"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[compat]
+Test = "1"
