@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "HighPrecisionLinearAlgebra.jl"
+abstract: "Parallel dense linear algebra in arbitrary (MPFR) and multi-word (MultiFloats) precision, with matrix products computed by the Ozaki scheme on Float64 BLAS."
+type: software
+authors:
+  - family-names: Mitsui
+    given-names: Satoshi
+version: 0.1.0
+license: MIT
+repository-code: "https://github.com/JuliaFewBody/HighPrecisionLinearAlgebra.jl"
+keywords:
+  - Julia
+  - arbitrary precision
+  - linear algebra
+  - Ozaki scheme
