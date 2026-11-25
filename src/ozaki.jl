@@ -8,9 +8,9 @@
 # Cholesky and triangular solves factor narrow panels in extended precision and do the trailing updates
 # (almost all the work) with these dgemms. The BLAS thread count is set separately from Julia's (BLAS.set_num_threads).
 
-nbits_of(::Type{Float64x4}) = 212
-nbits_of(::Type{Float64x2}) = 106
+nbits_of(::Type{MultiFloat{Float64,N}}) where {N} = 53N
 nbits_of(::Type{Float64}) = 53
+@inline _el(A::AbstractMatrix{T}, i, j) where {T<:MultiFloat} = @inbounds A[i, j]
 _nbits(A::AbstractMatrix{T}) where {T} = nbits_of(T)
 _nbits(A::AbstractMatrix{BigFloat}) = _prec(A)
 _nbits(A::AbstractMatrix{PElem}) = isempty(A) ? precision(BigFloat) : first(A).prec
@@ -74,7 +74,7 @@ function ozaki_slice!(F::AbstractMatrix{Float64}, R, e::Vector{Int}, A::Abstract
     end
     nothing
 end
-"β bits (β ≤ 32) at bit position pos of the non-negative integer stored in the n limbs at d."
+"β bits (β ≤ 63) at bit position pos of the non-negative integer stored in the n limbs at d."
 @inline function _getbits(d::Ptr{UInt64}, n::Int, pos::Int, β::Int)
     k = pos >> 6; sh = pos & 63
     k < n || return UInt64(0)
@@ -247,8 +247,8 @@ end
     chol_lower_ozaki!(A; nb, leaf=16, ozmin=16, blas_threads, scheme=:auto, wc=128, done=0, split=0) -> Bool
 
 Right-looking blocked Cholesky that overwrites the lower triangle with L (same contract as `chol_lower!`).
-The trailing update A[lo:M, lo:M] −= L_p L_pᵀ is done with dgemms: `scheme=:crt` (default for BigFloat) uses
-residues modulo primes and the Chinese remainder theorem (crt.jl); `:slice` (default otherwise) uses integer slices.
+The trailing update A[lo:M, lo:M] −= L_p L_pᵀ is done with dgemms: `scheme=:crt` (default for BigFloat and MultiFloat) uses
+residues modulo primes and the Chinese remainder theorem (crt.jl); `:slice` uses integer slices.
 Each panel of width nb is split recursively; inner updates of width ≥ ozmin also use dgemms, narrower ones run in
 extended precision in parallel row blocks. Only the leaf diagonal blocks (width leaf) are serial.
 `wc` is the number of columns per residue update (the result does not depend on it).
@@ -264,7 +264,7 @@ function chol_lower_ozaki!(A::AbstractMatrix{T}; nb::Union{Nothing,Int}=nothing,
     0 <= done <= M || throw(ArgumentError("done must be in 0:M"))
     done == M && return true
     brk = max(done, split)
-    crt = scheme === :crt || (scheme === :auto && T === BigFloat)
+    crt = scheme === :crt || (scheme === :auto && (T === BigFloat || T <: MultiFloat))
     nb = max(1, min(something(nb, crt ? 256 : 128), M))
     ws = crt ? _CrtWS(_nbits(A), nb, M; wc=wc) : _OzWS(_nbits(A), nb, M)
     try

@@ -281,3 +281,92 @@ end
     X = BigFloat.(randn(30, 5)); Hs = BigFloat.(randn(30, 30)); Hs = Hs + Hs'
     @test xtHx_mt(X, Hs) == X' * Hs * X
 end
+
+@testset "matrix products (Ozaki scheme)" begin
+    for bits in (256, 1024), (M, K, N) in ((50, 40, 30), (150, 200, 130))
+        setprecision(BigFloat, bits) do
+            A = (rand(BigFloat, M, K) .- 0.5) .* BigFloat(2) .^ rand(-30:30, M)
+            B = (rand(BigFloat, K, N) .- 0.5) .* BigFloat(2) .^ rand(-30:30, N)'
+            C0 = [BigFloat(rand()) for _ in 1:M, _ in 1:N]
+            for sub in (false, true)
+                R = setprecision(bits + 200) do; sub ? big.(C0) .- big.(A) * big.(B) : big.(C0) .+ big.(A) * big.(B); end
+                C = fresh(C0); gemm_ozaki!(C, A, B; sub)
+                @test all(abs(C[i, j] - R[i, j]) <= 2.0^(-bits + 1) * (abs(R[i, j]) + maximum(abs, A[i, :]) * maximum(abs, B[:, j])) for i in 1:M, j in 1:N)
+                C2 = fresh(C0); gemm_mt!(C2, A, B; sub)
+                @test maximum(abs, C2 - R) <= 2.0^(-bits) * K * maximum(abs, R)
+            end
+        end
+    end
+    for T in (Float64x2, Float64x4)
+        A = T.(randn(120, 90)); B = T.(randn(90, 70)); C = T.(randn(120, 70))
+        R = setprecision(400) do; big.(C) .+ big.(A) * big.(B); end
+        gemm_ozaki!(C, A, B)
+        @test maximum(abs.(big.(C) - R)) <= 100 * eps(T) * maximum(abs.(R))
+    end
+end
+
+@testset "LU and QR" begin
+    for T in (BigFloat, Float64x4)
+        T === BigFloat && setprecision(BigFloat, 320)
+        n = 200
+        A0 = T === BigFloat ? rand(BigFloat, n, n) .- 0.5 : T.(randn(n, n))
+        F = fresh(A0); ipiv, info = lu_ozaki!(F)
+        @test info == 0 && ipiv == lu(A0).ipiv
+        p = collect(1:n); for j in 1:n; p[j], p[ipiv[j]] = p[ipiv[j]], p[j]; end
+        @test fro(A0[p, :] - Matrix(UnitLowerTriangular(F)) * Matrix(UpperTriangular(F))) <= 100n * eps(T) * fro(A0)
+        b = A0[:, 1] .+ 1; x = lu_solve!(fresh(b), F, ipiv)
+        @test fro(A0 * x - b) <= 1e4 * eps(T) * fro(b)
+        for (m, k) in ((n, n), (250, 120))
+            A1 = A0[1:min(m, n), 1:k]; m > n && (A1 = vcat(A1, A0[1:m-n, 1:k]))
+            G = fresh(A1); Tm = qr_ozaki!(G)
+            Q = qr_Q(G, Tm); R = triu(G[1:k, :])
+            @test fro(A1 - Q * R) <= 100k * eps(T) * fro(A1)
+            @test fro(Q' * Q - I) <= 100k * eps(T)
+            @test maximum(abs, abs.(qr(A1).R) - abs.(R)) <= 1e3 * eps(T) * fro(A1)
+        end
+    end
+    setprecision(BigFloat, 320)
+    S = rand(BigFloat, 5, 5) .- 0.5; S[:, 3] .= 0
+    @test lu_ozaki!(fresh(S))[2] == 3
+end
+
+@testset "eigen_refine and svd_refine" begin
+    setprecision(BigFloat, 320) do
+        u = 2.0^-320
+        orth(n) = (F = rand(BigFloat, n, n) .- 0.5; Tm = qr_ozaki!(F); qr_Q(F, Tm))
+        A = rand(BigFloat, 120, 120) .- 0.5; A = (A + A') / 2
+        λ, X, info = eigen_refine(A)
+        @test fro(A * X - X * Diagonal(λ)) <= 1e3 * u * fro(A) && fro(X' * X - I) <= 1e4 * u && info.iters <= 4
+        Y = rand(BigFloat, 120, 120) .- 0.5; B = Y * Y' / 120 + I
+        λ, X, _ = eigen_refine(A, B)
+        @test fro(A * X - B * X * Diagonal(λ)) <= 1e3 * u * fro(A) && fro(X' * B * X - I) <= 1e4 * u
+        n = 60; Q = orth(n)                                        # eigenvalues 1e-30 and 1e-60 apart, and an exact double
+        d = BigFloat.(collect(1:n)) ./ n
+        d[2] = d[1] + big"1e-30"; d[3] = d[1] + big"2e-30"; d[11] = d[10] + big"1e-60"; d[21] = d[20]
+        A = Q * Diagonal(d) * Q'; A = (A + A') / 2
+        λ, X, info = eigen_refine(A)
+        @test info.clusters > 0 && maximum(abs, λ - sort(d)) <= 1e3 * u
+        @test fro(A * X - X * Diagonal(λ)) <= 1e3 * u * fro(A) && fro(X' * X - I) <= 1e4 * u
+        A4 = Float64x4.(randn(80, 80)); A4 = (A4 + A4') / 2
+        λ, X, _ = eigen_refine(A4)
+        @test fro(A4 * X - X * Diagonal(λ)) <= 1e3 * eps(Float64x4) * fro(A4)
+        for (m, k) in ((80, 80), (150, 60), (60, 150))
+            A = rand(BigFloat, m, k) .- 0.5
+            U, σ, V, _ = svd_refine(A)
+            @test fro(A - U * Diagonal(σ) * V') <= 1e3 * u * fro(A)
+            @test fro(U' * U - I) <= 1e4 * u && fro(V' * V - I) <= 1e4 * u && issorted(σ; rev=true)
+        end
+        n = 40; U0 = orth(n); V0 = orth(n)                         # singular values from 1 down to 1e-40
+        s0 = BigFloat(10) .^ (-collect(0:n-1) .* (40 / (n - 1)))
+        A = U0 * Diagonal(s0) * V0'
+        U, σ, V, _ = svd_refine(A)
+        @test maximum(abs.(σ - s0) ./ s0) <= 1e-50
+        @test fro(A - U * Diagonal(σ) * V') <= 1e4 * u * fro(A)
+        # Float64x4, eigenvalues from 1 down to 1e-40: S must be symmetrized or X loses orthogonality and oscillates
+        Q = Float64x4.(orth(n)); Q = Float64x4.(BigFloat.(qr_Q(Q, qr_ozaki!(Q))))
+        H = Q * Diagonal(Float64x4.(s0)) * Q'; H = (H + H') / 2
+        λ, X, info = eigen_refine(H)
+        ux = Float64(eps(Float64x4))
+        @test info.iters <= 8 && fro(X' * X - I) <= 1e3 * ux && fro(H * X - X * Diagonal(λ)) <= 1e3 * ux * fro(H)
+    end
+end

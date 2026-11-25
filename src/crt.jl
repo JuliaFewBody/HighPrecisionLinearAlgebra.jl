@@ -159,10 +159,53 @@ function _gres!(F::AbstractArray{Float64,3}, e::AbstractVector{Int}, get::G, row
     n = min(length(rts), length(rows))
     n == 0 && return nothing
     @sync for (slot, rr) in enumerate(Iterators.partition(rows, cld(length(rows), n)))
-        Threads.@spawn _gres_rows!(F, e, get, rr, K, cp, rts[slot])
+        Threads.@spawn _gres_rows!(F, e, get, rr, K, cp, rts[slot], Val(get(first(rows), 1) isa MultiFloat))
     end
     nothing
 end
+"""
+Residues of MultiFloat rows: each limb y = x_l 2^{B−e} is rounded to an integer on its own (the limbs do not overlap,
+so the total differs from round(x 2^{B−e}) by at most N/2), and its 16-bit digits are added with its sign into the
+digit slots; the residues are then one small dgemm per row, as for MPFR (|slot| < N·2^16, sums < 2^45 are exact).
+"""
+function _gres_rows!(F, e, get::G, rows, K, cp::_CrtParams, rt::_ResTmp, ::Val{true}) where {G}
+    nm = length(cp.p); B = cp.B; nin = cp.nin
+    PC = view(rt.PC, 1:K, :); R = view(rt.R, 1:K, :)
+    @inbounds for i in rows
+        ei = typemin(Int)
+        for k in 1:K
+            x0 = get(i, k)._limbs[1]
+            iszero(x0) || isfinite(x0) && (ex = exponent(x0) + 2; ex > ei && (ei = ex))
+        end
+        e[i] = ei
+        if ei == typemin(Int)
+            for m in 1:nm, k in 1:K; F[k, i, m] = 0.0; end
+            continue
+        end
+        for k in 1:K
+            for q in 1:nin; PC[k, q] = 0.0; end
+            for y0 in get(i, k)._limbs
+                t = round(ldexp(y0, B - ei))
+                iszero(t) && continue
+                a = abs(t); sh = max(exponent(a) - 52, 0)
+                mt = unsafe_trunc(UInt64, ldexp(a, -sh)); sg = t < 0 ? -1.0 : 1.0
+                for q in sh >> 4:min((sh + 52) >> 4, nin - 1)
+                    lo = 16q - sh
+                    PC[k, q+1] += sg * Float64((lo >= 0 ? mt >> lo : mt << -lo) & 0xffff)
+                end
+            end
+        end
+        BLAS.gemm!('N', 'N', 1.0, PC, cp.pw, 0.0, R)
+        for m in 1:nm
+            pm = cp.p[m]; pi = cp.pinv[m]
+            @simd for k in 1:K
+                F[k, i, m] = _smod(R[k, m], pm, pi)
+            end
+        end
+    end
+    nothing
+end
+_gres_rows!(F, e, get::G, rows, K, cp::_CrtParams, rt::_ResTmp, ::Val{false}) where {G} = _gres_rows!(F, e, get, rows, K, cp, rt)
 function _gres_rows!(F, e, get::G, rows, K, cp::_CrtParams, rt::_ResTmp) where {G}
     nm = length(cp.p); B = cp.B; nin = cp.nin
     pcs = rt.pcs; PC = view(rt.PC, 1:K, :); R = view(rt.R, 1:K, :); sg = rt.sg
@@ -209,7 +252,7 @@ function _crt_sub_block!(A, r0, c, nr, e, fj, cp::_CrtParams, tmp::_CrtTmp, Z=tm
     end
     @inbounds for i in 1:nr; zb[i, nm+1] = -round(s[i]); end
     BLAS.gemm!('N', 'T', 1.0, view(zb, 1:nr, :), cp.C, 0.0, view(acc, 1:nr, :))
-    big = tmp.big; d = big.d; t = tmp.t; nl = cld(nq, 4); top = nq - 4(nl - 1)
+    nl = cld(nq, 4); top = nq - 4(nl - 1)
     # Normalize the digit sums to [0, 2^16) with carries (vectorized across rows). The final carry is 0 or −1 (|Z| < P/2).
     ai = reinterpret(Int64, acc); cyv = reinterpret(Int64, s)
     @inbounds begin
@@ -233,6 +276,56 @@ function _crt_sub_block!(A, r0, c, nr, e, fj, cp::_CrtParams, tmp::_CrtTmp, Z=tm
             end
         end
     end
+    _crt_store!(A, r0, c, nr, e, fj, cp, tmp, ai, cyv, nl, top)
+    nothing
+end
+
+"Two's complement words of row i → magnitude in d[1:nl]; return (number of words, negative?) (0 words if zero)."
+@inline function _crt_words!(d, ai, cyv, i, nl, top)
+    nz = UInt64(0)
+    @inbounds for l in 1:nl; w = reinterpret(UInt64, ai[i, l]); unsafe_store!(d, w, l); nz |= w; end
+    neg = @inbounds cyv[i] < 0
+    if neg
+        top < 4 && unsafe_store!(d, unsafe_load(d, nl) | ~((UInt64(1) << (16top)) - 1), nl)
+        cy = UInt64(1)
+        for l in 1:nl
+            x = ~unsafe_load(d, l) + cy
+            cy = (cy == 1 && x == 0) ? UInt64(1) : UInt64(0)
+            unsafe_store!(d, x, l)
+        end
+    elseif nz == 0
+        return 0, false
+    end
+    n = nl
+    while n > 0 && unsafe_load(d, n) == 0; n -= 1; end
+    n, neg
+end
+
+# MultiFloat: the integer from its top 53-bit fields (exact Float64 each, disjoint bits, truncated below
+# nbits + 12 bits). The fields are already a non-overlapping expansion: the lowest ones are summed into the last limb
+# and one renormalization gives the MultiFloat.
+_nfields(::Type{MultiFloat{Float64,N}}) where {N} = cld(53N + 12, 53)
+@inline function _crt_field(d, n, tb, f, sc)
+    pos = tb - 53f
+    pos <= -53 && return 0.0
+    ldexp(Float64(pos >= 0 ? _getbits(d, n, pos, 53) : _getbits(d, n, 0, 53 + pos)), max(pos, 0) + sc)
+end
+function _crt_store!(A::AbstractMatrix{MultiFloat{Float64,N}}, r0, c, nr, e, fj, cp::_CrtParams, tmp::_CrtTmp, ai, cyv, nl, top) where {N}
+    T = MultiFloat{Float64,N}; d = tmp.big.d
+    @inbounds for i in 1:nr
+        e[i] == typemin(Int) && continue
+        n, neg = _crt_words!(d, ai, cyv, i, nl, top)
+        n == 0 && continue
+        sc = e[i] + fj - 2cp.B; tb = 64n - leading_zeros(unsafe_load(d, n))
+        fs = ntuple(f -> _crt_field(d, n, tb, f, sc), Val(_nfields(T)))
+        v = T(MultiFloats.renormalize(ntuple(l -> l < N ? fs[l] : +(fs[N:end]...), Val(N))))
+        A[r0 + i, c] = neg ? A[r0 + i, c] + v : A[r0 + i, c] - v
+    end
+    nothing
+end
+
+function _crt_store!(A, r0, c, nr, e, fj, cp::_CrtParams, tmp::_CrtTmp, ai, cyv, nl, top)
+    big = tmp.big; d = big.d; t = tmp.t
     @inbounds for i in 1:nr
         e[i] == typemin(Int) && continue
         nz = UInt64(0)
